@@ -250,6 +250,25 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+    def test_404_nous_generic_body_is_model_not_found(self):
+        # The Nous inference proxy answers a model without a route with a generic body and
+        # no model-specific phrasing; it must still fall back instead of retrying the dead model.
+        e = MockAPIError(
+            "Error code: 404 - {'status': 404, 'message': \"Couldn't find that, sorry.\"}",
+            status_code=404,
+            body={"status": 404, "message": "Couldn't find that, sorry."},
+        )
+        result = classify_api_error(e, provider="nous", model="deepseek/deepseek-v4.1-flash")
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_404_plain_not_found_stays_unknown(self):
+        # The generic-body rule must not swallow an ordinary 404 (wrong path, proxy glitch).
+        e = MockAPIError("Not Found", status_code=404, body={"status": 404, "message": "Not Found"})
+        result = classify_api_error(e, provider="nous", model="deepseek/deepseek-v4.1-flash")
+        assert result.reason != FailoverReason.model_not_found
+
     def test_wrapped_402_uses_nested_body_message(self):
         inner = MockAPIError(
             "inner",

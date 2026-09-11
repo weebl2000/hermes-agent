@@ -732,6 +732,10 @@ _OVERFLOW_AS_5XX_RULES = (
 _404_RULES = (
     (_403_404_WALL_PATTERNS, _V_BILLING), (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED),
     (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),
+    # Nous inference proxy generic 404 body ("Couldn't find that, sorry."): returned when the
+    # requested model has no route (e.g. a text-only chat SKU handed an image request), with no
+    # model-specific phrasing. 404 only, so the wording can't reclassify another status.
+    (("couldn't find that",), _V_MODEL_NOT_FOUND),
 )
 
 # 400 tail after the deterministic request-shape checks. Some providers return
