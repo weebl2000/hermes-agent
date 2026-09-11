@@ -199,7 +199,7 @@ def _extract_reply_fallback(body: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def _strip_reply_fallback(body: str) -> str:
-    """Strip the inline ``> quote\\n\\nreply`` fallback prefix; unchanged if absent."""
+    """Strip the inline ``> quote\n\nreply`` fallback prefix; unchanged if absent."""
     if not body or not body.startswith("> "):
         return body
     stripped = []
@@ -211,6 +211,98 @@ def _strip_reply_fallback(body: str) -> str:
             past_fallback = True
             if line == "":
                 continue
+        stripped.append(line)
+    return "\n".join(stripped) if stripped else body
+
+
+@dataclass
+class _MatrixMediaPayload:
+    """A media event resolved to a local file plus the metadata to describe it."""
+
+    cached_path: Optional[str]
+    http_url: str
+    media_type: str
+    msg_type: Any
+    is_voice: bool
+    is_encrypted: bool
+
+
+@dataclass
+class _MatrixQuotedEvent:
+    """The referenced message behind a reply or thread, resolved for context."""
+
+    text: Optional[str] = None
+    sender: Optional[str] = None
+    # Set only for quoted images: a local path the vision path can open.
+    media_path: Optional[str] = None
+    media_type: Optional[str] = None
+
+
+# Human labels for non-text msgtypes quoted as reply context. A media event's
+# ``body`` is its filename, so it needs a marker or the agent reads "cat.png"
+# as the quoted person's words.
+_MATRIX_MSGTYPE_LABELS = {
+    "m.image": "image",
+    "m.audio": "audio",
+    "m.video": "video",
+    "m.file": "file",
+    "m.emote": "emote",
+    "m.notice": "notice",
+    "m.location": "location",
+}
+
+
+def _matrix_content_dict(event: Any) -> dict:
+    """Best-effort extraction of an event's ``content`` as a plain dict.
+
+    Events arrive in three shapes depending on the path: raw dicts (sync
+    callbacks), mautrix attrs-based typed events (``get_event`` /
+    ``get_messages``), and dict-like ``Obj`` wrappers.  Returns ``{}`` rather
+    than raising when the shape is unrecognized.
+    """
+    content = getattr(event, "content", None)
+    if content is None and isinstance(event, dict):
+        content = event.get("content", {})
+    if isinstance(content, dict):
+        return content
+    if content is None:
+        return {}
+    # mautrix typed content (SerializableAttrs) round-trips through serialize().
+    serialize = getattr(content, "serialize", None)
+    if callable(serialize):
+        try:
+            serialized = serialize()
+            if isinstance(serialized, dict):
+                return serialized
+        except Exception:
+            pass
+    try:
+        return dict(content)
+    except Exception:
+        return {}
+
+
+def _strip_matrix_reply_fallback(body: str) -> str:
+    """Drop the legacy ``> quoted`` rich-reply fallback prefix from a body.
+
+    Matrix's pre-MSC2781 reply fallback prepends the quoted event's body as
+    blockquote lines followed by a blank line.  Clients render the quote from
+    ``m.relates_to`` instead, so the fallback is noise in the trigger text —
+    and it cascades (a reply to a reply embeds both).  Returns ``body``
+    unchanged when no fallback is present.
+    """
+    if not body or not body.startswith("> "):
+        return body
+    stripped: list[str] = []
+    past_fallback = False
+    for line in body.split("\n"):
+        if not past_fallback:
+            if line.startswith("> ") or line == ">":
+                continue
+            if line == "":
+                past_fallback = True
+                continue
+            past_fallback = True
         stripped.append(line)
     return "\n".join(stripped) if stripped else body
 
@@ -846,7 +938,22 @@ class MatrixAdapter(BasePlatformAdapter):
         from collections import deque
         self._processed_events: deque = deque(maxlen=1000)  # event dedup, newest kept
         self._processed_events_set: set = set()
-        self._threads = ThreadParticipationTracker("matrix")  # require_mention bypass
+
+        # Quoted-event text cache for reply/thread context injection.
+        # Keyed by (room_id, event_id) -> (body, sender). A thread root is
+        # re-fetched on every message in that thread otherwise.
+        from collections import OrderedDict
+
+        self._quoted_event_cache: "OrderedDict[tuple, _MatrixQuotedEvent]" = OrderedDict()
+        self._quoted_event_cache_max = 256
+
+        # Buffer for undecrypted events pending key receipt.
+        # Each entry: (room_id, event, timestamp)
+
+        # Thread participation tracking (for require_mention bypass)
+        self._threads = ThreadParticipationTracker("matrix")
+
+        # Mention/thread gating — parsed once from config.extra or env vars.
         self._require_mention: bool = self._parse_require_mention(config)
         self._thread_require_mention: bool = self._parse_thread_require_mention(config)
         self._free_rooms: Set[str] = _extra_csv_set(config, "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS")
@@ -2043,7 +2150,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self, room_id: str, body: str, relates_to: dict
     ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
         """Return (body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name). Captures
-        the inline reply fallback (``> <@user:srv> text\\n\\nreply``) BEFORE stripping it, so the
+        the inline reply fallback (``> <@user:srv> text\n\nreply``) BEFORE stripping it, so the
         prompt layer can render "[Replying to: ...]" like Signal/Slack/Telegram."""
         reply_to = (relates_to.get("m.in_reply_to") or {}).get("event_id")
         reply_to_text = reply_to_author_id = reply_to_author_name = None
@@ -2073,12 +2180,39 @@ class MatrixAdapter(BasePlatformAdapter):
             extra["message_type"] = MessageType.COMMAND if body.startswith("/") else MessageType.TEXT
         elif _is_bare_media_filename(media_msgtype, body):
             body = ""  # transport filename, not user text
+
+        # Quoted-event resolution (thread roots + quoted media). A quoted
+        # image rides along so the vision path can see it — asking "what tree
+        # is this?" in a thread on a photo needs the photo, not its filename.
+        quote_anchor = self._resolve_reply_anchors(relates_to, event_id)[1]
+        quoted = await self._fetch_quoted_event(room_id, quote_anchor)
+
+        # Thread replies only reach the root text via m.thread / m.in_reply_to;
+        # the inline fallback is absent, so fall back to the resolved event.
+        if not reply_to_text and quoted.text:
+            reply_to_text = quoted.text
+            if reply_to_author_id is None and quoted.sender:
+                reply_to_author_id = quoted.sender
+                reply_to_author_name = await self._get_display_name(room_id, quoted.sender)
+
+        if quoted.media_path:
+            existing_urls = extra.get("media_urls") or []
+            existing_types = extra.get("media_types") or []
+            extra["media_urls"] = list(existing_urls) + [quoted.media_path]
+            extra["media_types"] = list(existing_types) + [quoted.media_type or "image/jpeg"]
+
         return MessageEvent(
             text=body, source=source, raw_message=source_content, message_id=event_id,
             reply_to_message_id=reply_to, reply_to_text=reply_to_text, reply_to_author_id=reply_to_author_id,
             reply_to_author_name=reply_to_author_name,
             # Top-level sender fields mirror source.* — downstream prompt code reads them.
-            user_id=sender, user_name=display_name, **extra)
+            user_id=sender, user_name=display_name,
+            # Mark replies to our own messages so downstream layers can tell
+            # a self-reply apart from a normal mention.
+            reply_to_is_own_message=bool(
+                reply_to_author_id and self._user_id and reply_to_author_id == self._user_id
+            ),
+            **extra)
 
     async def _handle_text_message(
         self, room_id: str, sender: str, event_id: str, event_ts: float, source_content: dict,
@@ -2187,6 +2321,93 @@ class MatrixAdapter(BasePlatformAdapter):
             return await cache_audio_from_bytes_async(file_bytes, ext=ext)
         filename = body or ("video.mp4" if msg_type == MessageType.VIDEO else "document")
         return await cache_document_from_bytes_async(file_bytes, filename)
+
+    async def _extract_media_payload(
+        self,
+        content: dict,
+        event_id: str,
+        msgtype: str,
+        body: str,
+    ) -> Optional["_MatrixMediaPayload"]:
+        """Resolve a media event's content to a local file plus its metadata.
+
+        Returns ``None`` when the event must be rejected outright (non-MXC URL
+        or over ``MATRIX_MAX_MEDIA_BYTES``).  Shared by the inbound media
+        handler and by quoted-event resolution, so a replied-to image reaches
+        the vision path the same way a directly-attached one does.
+        """
+        url = content.get("url", "")
+        if url and not str(url).startswith("mxc://"):
+            logger.warning(
+                "[Matrix] Rejecting inbound media %s with non-MXC URL",
+                event_id,
+            )
+            return None
+
+        # Convert mxc:// to HTTP URL for downstream processing.
+        http_url = ""
+        if url and url.startswith("mxc://"):
+            http_url = self._mxc_to_http(url)
+
+        # Extract MIME type from content info.
+        content_info = content.get("info", {})
+        if not isinstance(content_info, dict):
+            content_info = {}
+        event_mimetype = content_info.get("mimetype", "")
+        event_size = content_info.get("size")
+        try:
+            event_size_int = int(event_size) if event_size is not None else 0
+        except (TypeError, ValueError):
+            event_size_int = 0
+        if event_size_int and event_size_int > self._max_media_bytes:
+            logger.warning(
+                "[Matrix] Rejecting oversized inbound media %s (%d > %d bytes)",
+                event_id,
+                event_size_int,
+                self._max_media_bytes,
+            )
+            return None
+
+        # Encrypted media carries the URL in file.url.
+        file_content = content.get("file", {})
+        if not url and isinstance(file_content, dict):
+            url = file_content.get("url", "") or ""
+            if url and not str(url).startswith("mxc://"):
+                logger.warning(
+                    "[Matrix] Rejecting inbound encrypted media %s with non-MXC URL",
+                    event_id,
+                )
+                return None
+            if url and url.startswith("mxc://"):
+                http_url = self._mxc_to_http(url)
+
+        is_encrypted_media = bool(
+            file_content and isinstance(file_content, dict) and file_content.get("url")
+        )
+
+        msg_type, media_type, is_voice_message = self._classify_inbound_media(
+            msgtype, event_mimetype, content
+        )
+
+        # Cache locally so downstream tools get a real file path.
+        cached_path = None
+        if url:
+            try:
+                cached_path = await self._download_and_cache_media(
+                    url, event_id, file_content if is_encrypted_media else None,
+                    msg_type, media_type, is_voice_message, body)
+            except Exception as e:
+                logger.warning("[Matrix] Failed to cache media: %s", e)
+
+        return _MatrixMediaPayload(
+            cached_path=cached_path,
+            http_url=http_url,
+            media_type=media_type,
+            msg_type=msg_type,
+            is_voice=is_voice_message,
+            is_encrypted=is_encrypted_media,
+        )
+
 
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""
@@ -2561,6 +2782,63 @@ class MatrixAdapter(BasePlatformAdapter):
             lambda: self._client.invite_user(RoomID(room_id), UserID(user_id)),
             ("Matrix: invited %s to %s", user_id, room_id), "Matrix: invite error: %s")
 
+    async def fetch_history(
+        self,
+        room_id: str,
+        limit: int = 20,
+        from_token: str = "",
+    ) -> list[dict[str, Any]]:
+        """Fetch recent Matrix room history using the live client."""
+        if not self._client:
+            return []
+        limit = max(1, min(int(limit or 20), 100))
+        try:
+            direction = getattr(PaginationDirection, "BACKWARD", "b")
+            if hasattr(self._client, "messages"):
+                response = await self._client.messages(
+                    RoomID(room_id),
+                    from_token=SyncToken(from_token) if from_token else None,
+                    direction=direction,
+                    limit=limit,
+                )
+            elif hasattr(self._client, "get_messages"):
+                response = await self._client.get_messages(
+                    RoomID(room_id),
+                    start=SyncToken(from_token) if from_token else None,
+                    direction=direction,
+                    limit=limit,
+                )
+            else:
+                logger.debug("Matrix: client has no messages/get_messages method")
+                return []
+            chunk = getattr(response, "chunk", None)
+            if chunk is None and isinstance(response, dict):
+                chunk = response.get("chunk")
+            return [self._serialize_history_event(evt) for evt in (chunk or [])]
+        except Exception as exc:
+            logger.warning("Matrix: fetch history error: %s", exc)
+            return []
+
+    def _serialize_history_event(self, event: Any) -> dict[str, Any]:
+        content = _matrix_content_dict(event)
+        return {
+            "event_id": str(
+                getattr(event, "event_id", "")
+                or (event.get("event_id", "") if isinstance(event, dict) else "")
+            ),
+            "sender": str(
+                getattr(event, "sender", "")
+                or (event.get("sender", "") if isinstance(event, dict) else "")
+            ),
+            "timestamp": _matrix_event_timestamp_seconds(event),
+            "msgtype": str(content.get("msgtype", "")),
+            "body": str(content.get("body", "")),
+        }
+
+    # ------------------------------------------------------------------
+    # Presence
+    # ------------------------------------------------------------------
+
     _VALID_PRESENCE_STATES = frozenset(("online", "offline", "unavailable"))
 
     async def set_presence(self, state: str = "online", status_msg: str = "") -> bool:
@@ -2806,6 +3084,192 @@ class MatrixAdapter(BasePlatformAdapter):
         if user_id.startswith("@") and ":" in user_id:
             return user_id[1:].split(":")[0]
         return user_id
+
+    @staticmethod
+    def _resolve_reply_anchors(
+        relates_to: dict, event_id: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Return ``(reply_to_message_id, quote_anchor)`` for an inbound event.
+
+        The two differ inside threads.  Per MSC3440 a thread reply carries a
+        fallback ``m.in_reply_to`` pointing at whatever was *last* in the
+        thread, flagged by ``is_falling_back`` — that is a rendering nicety,
+        not something the user chose.  The message the user actually opened the
+        thread on is the thread root, so that is what gets quoted.  An explicit
+        reply (no ``is_falling_back``) is a deliberate choice and wins.
+        """
+        in_reply_to = relates_to.get("m.in_reply_to")
+        if not isinstance(in_reply_to, dict):
+            in_reply_to = {}
+        reply_to = in_reply_to.get("event_id") or None
+
+        thread_root = None
+        if relates_to.get("rel_type") == "m.thread":
+            thread_root = relates_to.get("event_id") or None
+        is_falling_back = bool(relates_to.get("is_falling_back"))
+
+        if reply_to and not (thread_root and is_falling_back):
+            quote_anchor = reply_to
+        else:
+            quote_anchor = thread_root or reply_to
+
+        # A thread reply with no in_reply_to at all still references its root;
+        # gateway.run gates the "[Replying to: ...]" prefix on both fields.
+        if not reply_to and thread_root and thread_root != event_id:
+            reply_to = thread_root
+
+        if quote_anchor == event_id:
+            quote_anchor = None
+        return reply_to, quote_anchor
+
+    async def _fetch_quoted_event(
+        self, room_id: str, event_id: Optional[str]
+    ) -> "_MatrixQuotedEvent":
+        """Resolve a referenced event into quotable reply context.
+
+        Populates ``reply_to_text`` so ``gateway.run`` can inject the
+        ``[Replying to: "..."]`` pointer.  Without it the agent only receives an
+        opaque event ID it cannot dereference — the reason replies and thread
+        roots read as missing context.
+
+        A quoted *image* is downloaded and returned as a local path so the
+        vision path can actually look at it.  Naming the file without supplying
+        it is worse than saying nothing: the agent goes hunting the filesystem
+        for a name it will never find.
+
+        Returns an empty result on any failure; losing the quote degrades the
+        turn, it must never drop the message.
+        """
+        empty = _MatrixQuotedEvent()
+        if not self._client or not room_id or not event_id:
+            return empty
+
+        cache_key = (str(room_id), str(event_id))
+        cached = self._quoted_event_cache.get(cache_key)
+        if cached is not None:
+            self._quoted_event_cache.move_to_end(cache_key)
+            # A cached media path can be swept by cache cleanup; re-fetch it
+            # rather than handing downstream a path that no longer resolves.
+            if not cached.media_path or Path(cached.media_path).exists():
+                return cached
+            del self._quoted_event_cache[cache_key]
+
+        try:
+            if not hasattr(self._client, "get_event"):
+                logger.debug("Matrix: client has no get_event method")
+                return empty
+            event = await self._client.get_event(RoomID(room_id), EventID(event_id))
+        except Exception as exc:
+            logger.debug(
+                "Matrix: could not fetch quoted event %s in %s: %s",
+                event_id,
+                room_id,
+                exc,
+            )
+            return empty
+
+        try:
+            event = await self._decrypt_quoted_event(event)
+            if event is None:
+                return empty
+
+            content = _matrix_content_dict(event)
+            serialized = self._serialize_history_event(event)
+            body = _strip_matrix_reply_fallback(serialized.get("body", "") or "")
+            sender = serialized.get("sender", "") or None
+            msgtype = serialized.get("msgtype", "")
+
+            result = _MatrixQuotedEvent(sender=sender)
+
+            if msgtype == "m.image":
+                result = await self._resolve_quoted_image(
+                    content, event_id, body, sender
+                )
+            elif msgtype and msgtype != "m.text":
+                label = _MATRIX_MSGTYPE_LABELS.get(msgtype)
+                if label:
+                    body = f"[{label}: {body}]" if body else f"[{label}]"
+                result.text = body or None
+            else:
+                result.text = body or None
+        except Exception as exc:
+            logger.debug(
+                "Matrix: could not read quoted event %s in %s: %s",
+                event_id,
+                room_id,
+                exc,
+            )
+            return empty
+
+        # Cached either way — a redacted or bodyless root would otherwise be
+        # re-fetched on every message in its thread.
+        self._quoted_event_cache[cache_key] = result
+        self._quoted_event_cache.move_to_end(cache_key)
+        while len(self._quoted_event_cache) > self._quoted_event_cache_max:
+            self._quoted_event_cache.popitem(last=False)
+        return result
+
+    async def _resolve_quoted_image(
+        self,
+        content: dict,
+        event_id: str,
+        body: str,
+        sender: Optional[str],
+    ) -> "_MatrixQuotedEvent":
+        """Download a quoted image so it reaches the agent as a real picture.
+
+        Falls back to a bare ``[image]`` marker when the download fails. The
+        marker deliberately omits the filename: a name with no file behind it
+        reads as a lead worth chasing, and the agent will burn turns searching
+        the filesystem for it.
+        """
+        caption = "" if _looks_like_matrix_image_filename(body) else body
+
+        payload = await self._extract_media_payload(
+            content, event_id, "m.image", body
+        )
+        if payload is None or not payload.cached_path:
+            logger.debug(
+                "Matrix: quoted image %s unavailable; sending marker only", event_id
+            )
+            return _MatrixQuotedEvent(
+                text=f"[image: {caption}]" if caption else "[image]",
+                sender=sender,
+            )
+
+        return _MatrixQuotedEvent(
+            text=f"[image: {caption}]" if caption else "[image]",
+            sender=sender,
+            media_path=payload.cached_path,
+            media_type=payload.media_type,
+        )
+
+    async def _decrypt_quoted_event(self, event: Any) -> Any:
+        """Decrypt a fetched event when it came back as ``m.room.encrypted``.
+
+        ``get_event`` bypasses the sync loop's decryption dispatcher, so in an
+        E2EE room the raw ciphertext event is what lands here.
+        """
+        if event is None:
+            return None
+        event_type = getattr(event, "type", None)
+        if event_type is None and isinstance(event, dict):
+            event_type = event.get("type")
+        # mautrix EventType exposes the wire string on ``.t``; raw dicts and the
+        # import stub are already strings.
+        type_str = str(getattr(event_type, "t", event_type) or "")
+        if type_str != "m.room.encrypted":
+            return event
+
+        crypto = getattr(self._client, "crypto", None)
+        if crypto is None or not hasattr(crypto, "decrypt_megolm_event"):
+            logger.debug("Matrix: no crypto machine to decrypt quoted event")
+            return None
+        try:
+            return await crypto.decrypt_megolm_event(event)
+        except Exception as exc:
+            logger.debug("Matrix: could not decrypt quoted event: %s", exc)
+            return None
 
     def _mxc_to_http(self, mxc_url: str) -> str:
         if not mxc_url.startswith("mxc://"):
