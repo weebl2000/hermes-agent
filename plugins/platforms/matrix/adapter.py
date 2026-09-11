@@ -2531,7 +2531,6 @@ class MatrixAdapter(BasePlatformAdapter):
             is_encrypted=is_encrypted_media,
         )
 
-
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""
         room_id = str(getattr(event, "room_id", ""))
